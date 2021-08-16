@@ -4,31 +4,31 @@
     [get-in set! reset! conj! swap! dissoc! deref parents key take take-last])
   #?(:clj
      (:import
-       [com.firebase.client
-        AuthData
-        ChildEventListener
-        Config
-        DataSnapshot
-        Firebase
-        FirebaseError
-        MutableData
-        ServerValue
-        Transaction
-        Transaction$Handler
-        ValueEventListener
-        Firebase$CompletionListener
-        Transaction$Result
-        Logger$Level
-        Firebase$AuthResultHandler
-        Firebase$AuthStateListener]
-       (java.util HashMap ArrayList)))
+      [com.google.firebase 
+       FirebaseOptions 
+       FirebaseApp]
+      [com.google.firebase.database
+       ChildEventListener
+       FirebaseDatabase
+       DatabaseReference
+       DatabaseReference$CompletionListener
+       DataSnapshot
+       DatabaseError
+       MutableData
+       ServerValue
+       Transaction
+       Transaction$Handler
+       Transaction$Result
+       ValueEventListener]
+      [com.google.auth.oauth2 GoogleCredentials]))
   (:require
-    [clojure.string :as str]
-    [clojure.walk :as walk]
-    [matchbox.utils :as utils]
-    [matchbox.registry :refer [register-listener register-auth-listener disable-auth-listener!]]
-    [matchbox.serialization.keyword :as keyword]
-    #?(:cljs cljsjs.firebase)))
+   [clojure.string :as str]
+   [clojure.java.io :as io]
+   [clojure.walk :as walk]
+   [matchbox.utils :as utils]
+   [matchbox.registry :refer [register-listener register-auth-listener disable-auth-listener!]]
+   [matchbox.serialization.keyword :as keyword]
+   #?(:cljs cljsjs.firebase)))
 
 ;; constants
 
@@ -44,20 +44,13 @@
 (def all-events
   (conj child-events :value))
 
-#?(:clj
+#_#?(:clj
 (def logger-levels
   {:debug Logger$Level/DEBUG
    :info  Logger$Level/INFO
    :warn  Logger$Level/WARN
    :error Logger$Level/ERROR
    :none  Logger$Level/NONE}))
-
-#_#?(:clj
-(defn set-logger-level! [key]
-  (assert (contains? logger-levels key) (format "Unknown logger level: `%s`" key))
-  (.setLogLevel ^Config (Firebase/getDefaultConfig)
-                (logger-levels key))))
-
 
 (def SERVER_TIMESTAMP
   #?(:clj ServerValue/TIMESTAMP
@@ -70,12 +63,12 @@
 (declare reset!)
 
 (defn throw-fb-error [err & [msg]]
-  (throw (ex-info (or msg "FirebaseError") {:err err})))
+  (throw (ex-info (or msg "DatabaseError") {:err err})))
 
 #?(:clj
     (defn- wrap-cb [cb]
-      (reify Firebase$CompletionListener
-        (^void onComplete [_ ^FirebaseError err ^Firebase ref]
+      (reify DatabaseReference$CompletionListener
+        (^void onComplete [_ ^DatabaseError err ^DatabaseReference ref]
           (if err (throw-fb-error err "Cancelled") (cb ref))))))
 
 #?(:clj
@@ -84,7 +77,7 @@
         (reify ValueEventListener
           (^void onDataChange [_ ^DataSnapshot ds]
             (cb (ds-wrapper ds)))
-          (^void onCancelled [_ ^FirebaseError err]
+          (^void onCancelled [_ ^DatabaseError err]
             (if err (throw-fb-error err "Cancelled") (cb ref)))))))
 
 #?(:clj
@@ -94,7 +87,7 @@
           (let [current (hydrate (.getValue d))]
             (reset! d (apply f current args))
             (Transaction/success d)))
-        (^void onComplete [_ ^FirebaseError error, ^boolean committed, ^DataSnapshot d]
+        (^void onComplete [_ ^DatabaseError error, ^boolean committed, ^DataSnapshot d]
           (if (and cb (not error) committed)
             (cb (hydrate (.getValue d))))))))
 
@@ -109,7 +102,7 @@
           (if moved (moved (wrap-snapshot d))))
         (^void onChildRemoved [_ ^DataSnapshot d]
           (if removed (removed (wrap-snapshot d))))
-        (^void onCancelled [_ ^FirebaseError err]
+        (^void onCancelled [_ ^DatabaseError err]
           (throw-fb-error err "Cancelled")))))
 
 #?(:clj
@@ -142,14 +135,18 @@
 
 (defn get-in
   "Obtain child reference from base by following korks"
-  [ref korks]
+  [_ korks]
   (let [path (utils/korks->path korks)]
-    (if-not (seq path) ref (.child ref path))))
+    (-> (FirebaseDatabase/getInstance)
+        (.getReference path))))
 
 (defn connect
   "Create a reference for firebase"
   ([url]
-   #?(:clj (Firebase. url)
+   #?(:clj (FirebaseApp/initializeApp (-> (FirebaseOptions/builder)
+                                          (.setCredentials (GoogleCredentials/fromStream (io/input-stream "/Users/ron/.config/gapi/serviceAccountKey.json")))
+                                          (.setDatabaseUrl url)
+                                          (.build)))
       :cljs (js/Firebase. url)))
   ([url korks]
    (get-in (connect url) korks)))
@@ -270,7 +267,7 @@
 
 ;;
 
-(defn ref? [x] (instance? #?(:clj Firebase :cljs js/Firebase) x))
+(defn ref? [x] (instance? #?(:clj DatabaseReference :cljs js/Firebase) x))
 
 (defn- with-ds [ref-or-ds f & [cb]]
   (if (ref? ref-or-ds)
@@ -407,51 +404,32 @@
   (walk/keywordize-keys (into {} data)))
 
 (defn- auth-data->map [auth-data]
-  #?(:cljs (hydrate auth-data)
-     :clj (if auth-data
-            {:uid           (.getUid auth-data)
-             :provider      (keyword (.getProvider auth-data))
-             :token         (.getToken auth-data)
-             :expires       (.getExpires auth-data)
-             :auth          (ensure-kw-map (.getAuth auth-data))
-             :provider-data (ensure-kw-map (.getProviderData auth-data))})))
+  #?(:cljs (hydrate auth-data)))
 
 (defn wrap-auth-changed [cb]
   #?(:cljs
      (if cb
        (fn [err info]
          (cb err (js->clj info :keywordize-keys true)))
-       identity)
-     :clj
-     (reify Firebase$AuthStateListener
-       (^void onAuthStateChanged [_ ^AuthData auth-data]
-         (if cb (cb nil (auth-data->map auth-data)))))))
+       identity)))
 
 (defn- wrap-auth-cb [cb]
   #?(:cljs
       (if cb
         (fn [err info]
           (cb err (js->clj info :keywordize-keys true)))
-        identity)
-     :clj
-      (reify Firebase$AuthResultHandler
-        (^void onAuthenticated [_ ^AuthData auth-data]
-          (if cb (cb nil (auth-data->map auth-data))))
-        (^void onAuthenticationError [_ ^FirebaseError err]
-          (if cb (cb err nil))))))
+        identity)))
 
 (defn create-user
   "create-user creates a user in the Firebase built-in authentication server"
   [ref email password & [cb]]
   (.createUser ref
-               #?@(:cljs [#js {:email email, :password password}]
-                  :clj [email password])
+               #?@(:cljs [#js {:email email, :password password}])
                (wrap-auth-cb cb)))
 
 (defn auth [ref email password & [cb session-only?]]
   (.authWithPassword ref
-                     #?(:cljs #js {:email email, :password password})
-                     #?@(:clj [email password])
+                     #?(:cljs #js {:email email, :password password})                     
                      (wrap-auth-cb cb)
                      #?(:cljs (build-opts session-only?))))
 
